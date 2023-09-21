@@ -7,18 +7,13 @@ def Page():
 
     import astropy.units as u
     from astropy.utils.data import download_file
-    from astropy.nddata import StdDevUncertainty
 
-    from specutils import SpectrumList, SpectrumCollection, SpectralRegion
-
-    from glue.core.roi import XRangeROI
-    from glue.core.edit_subset_mode import NewMode
+    from specutils import SpectrumCollection, SpectralRegion
 
     import ipyvuetify as v
-    import solara
 
-    from jdaviz.core.helpers import ConfigHelper
     import jdaviz
+    from jdaviz import Specviz
     from jdaviz.app import custom_components
     from specutils import Spectrum1D
 
@@ -27,6 +22,100 @@ def Page():
     import ipysplitpanes
     import ipygoldenlayout
 
+    from specutils.fitting import fit_generic_continuum
+    from specutils.manipulation import trapezoid_smooth
+    from astropy.modeling.models import Chebyshev1D
+    from astropy.stats import mad_std
+    from scipy.stats import binned_statistic
+    from specutils.manipulation import extract_region
+    
+    urls_loaded = set()
+    def combine_orders(all_orders):
+        normalized_orders = []
+        continuum_orders = []
+        for original_spectrum, exclude_regions in zip(
+            [all_orders[89], all_orders[90]], 
+            [SpectralRegion(3950*u.AA, 3975*u.AA), SpectralRegion(3915*u.AA, 3950*u.AA)]
+        ):
+            spectrum = trapezoid_smooth(original_spectrum, 201)
+            x = spectrum.spectral_axis
+            model = Chebyshev1D(6)
+            g1_fit = fit_generic_continuum(spectrum, model=model, median_window=1, exclude_regions=exclude_regions)
+            y_continuum_fitted = g1_fit(x)
+
+            sort_lam = np.argsort(original_spectrum.wavelength)
+            normalized_spectrum = Spectrum1D(flux=(original_spectrum.flux / y_continuum_fitted)[sort_lam], spectral_axis=original_spectrum.wavelength[sort_lam])
+            normalized_orders.append(normalized_spectrum)
+            continuum_orders.append(y_continuum_fitted[sort_lam])
+
+        extracted_spectra = []
+
+        for i in range(2):
+            bs_std = binned_statistic(
+                normalized_orders[i].wavelength.value,
+                normalized_orders[i].flux.value,
+                bins=100,
+                statistic=lambda x: mad_std(x, ignore_nan=True)
+            )
+
+            bs_model = binned_statistic(
+                normalized_orders[i].wavelength.value,
+                continuum_orders[i],
+                bins=100,
+            )
+            wl_bins = 0.5 * (bs_std.bin_edges[1:] + bs_std.bin_edges[:-1])
+
+            p = np.polyfit(wl_bins - wl_bins.mean(), bs_std.statistic, 2, w=bs_model.statistic)
+            fit = np.polyval(p, wl_bins - wl_bins.mean())
+
+            min_std = fit.min()
+
+            diff_sign = np.sign(fit - 2.5 * min_std)
+            crossing_points = np.squeeze(np.argwhere(diff_sign[1:] != diff_sign[:-1]))
+
+            high_snr_region = SpectralRegion(
+                *(wl_bins[crossing_points] * normalized_orders[0].wavelength.unit)
+            )
+            extracted = extract_region(normalized_orders[i], high_snr_region)
+            extracted_spectra.append(extracted)
+
+        result = []
+        flux_medians = []
+        for i, order in enumerate(extracted_spectra):
+
+            if i == 0:
+                condition = order.wavelength.value < extracted_spectra[1-i].wavelength.value.max()
+            else:
+                condition = order.wavelength.value > extracted_spectra[1-i].wavelength.value.min()
+
+            flux_median = np.nanmedian(order.flux.value[condition])
+            flux_medians.append(flux_median)
+
+            wl_span = order.wavelength.value[condition]
+
+            normalization = 1
+            if i == 1:
+                normalization = flux_medians[0] / flux_median
+
+            if i == 0:
+                use_region = np.ones_like(order.flux.value).astype(bool)
+            else: 
+                use_region = np.logical_not(condition)
+
+            #only use the non-overlapping wavelength region:
+            result.append(
+                np.column_stack([order.flux.value * normalization, order.wavelength.value])[use_region]
+            )
+        result = np.vstack(result)
+        sort = np.argsort(result[:, 1])
+
+        combined_orders = Spectrum1D(
+            flux=result[sort, 0]*order.flux.unit, 
+            spectral_axis=result[sort, 1]*order.wavelength.unit
+        )
+        return combined_orders
+            
+    
     ipysplitpanes.SplitPanes()
     ipygoldenlayout.GoldenLayout()
     for name, path in custom_components.items():
@@ -38,224 +127,47 @@ def Page():
     all_owls_links_path = 'all_owls_links.json'
 
     links = json.load(open(all_owls_links_path, 'r'))
-
-    class OWLSviz(ConfigHelper):
-        """OWLS-Specviz Helper class."""
-
-        _default_configuration = "./owls.yaml"
-
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._default_spectrum_viewer_reference_name = None
-
-        def load_data(self, data, data_label=None, format=None, show_in_viewer=True,
-                      concat_by_file=False):
-            """
-            Load data into OWLSviz.
-
-            Parameters
-            ----------
-            data : str, `~specutils.Spectrum1D`, or `~specutils.SpectrumList`
-                Spectrum1D, SpectrumList, or path to compatible data file.
-            data_label : str
-                The Glue data label found in the ``DataCollection``.
-            format : str
-                Loader format specification used to indicate data format in
-                `~specutils.Spectrum1D.read` io method.
-            show_in_viewer : bool
-                Show data in viewer(s).
-            concat_by_file : bool
-                If True and there is more than one available extension, concatenate
-                the extensions within each spectrum file passed to the parser and
-                add a concatenated spectrum to the data collection.
-            """
-            super().load_data(data,
-                              parser_reference='specviz-spectrum1d-parser',
-                              data_label=data_label,
-                              format=format,
-                              show_in_viewer=show_in_viewer,
-                              concat_by_file=concat_by_file)
-
-        def get_data(self, data_label=None, spectral_subset=None, cls=None,
-                     use_display_units=False, **kwargs):
-            """
-            Returns data with name equal to data_label of type cls with subsets applied from
-            spectral_subset.
-
-            Parameters
-            ----------
-            data_label : str, optional
-                Provide a label to retrieve a specific data set from data_collection.
-            spectral_subset : str, optional
-                Spectral subset applied to data.
-            cls : `~specutils.Spectrum1D`, optional
-                The type that data will be returned as.
-            use_display_units: bool, optional
-                Whether to convert to the display units defined in the <unit-conversion> plugin.
-
-            Returns
-            -------
-            data : cls
-                Data is returned as type cls with subsets applied.
-
-            """
-            spatial_subset = kwargs.pop("spatial_subset", None)
-            function = kwargs.pop("function", None)
-            if len(kwargs) > 0:
-                raise ValueError(f'kwargs {[x for x in kwargs.keys()]} are not valid')
-
-            if cls is None:
-                cls = Spectrum1D
-            elif spatial_subset or function:
-                raise ValueError('kwargs spatial subset and function are not valid in specviz')
-            else:
-                spatial_subset = None
-                function = None
-
-            return self._get_data(data_label=data_label, spatial_subset=spatial_subset,
-                                  spectral_subset=spectral_subset, function=function,
-                                  cls=cls, use_display_units=use_display_units)
-
-        def x_limits(self, x_min=None, x_max=None):
-            """Sets the limits of the x-axis
-
-            Parameters
-            ----------
-            x_min
-                The lower bound of the axis. Can also be a Specutils SpectralRegion
-            x_max
-                The upper bound of the axis
-            """
-            scale = self.app.get_viewer(self._default_spectrum_viewer_reference_name).scale_x
-            if x_min is None and x_max is None:
-                return scale
-
-            # Retrieve the spectral axis
-            ref_index = getattr(
-                self.app.get_viewer(self._default_spectrum_viewer_reference_name).state.reference_data,
-                "label", None
-            )
-            ref_spec = self.get_data(ref_index)
-            self._set_scale(scale, ref_spec.spectral_axis, x_min, x_max)
-
-        def _set_scale(self, scale, axis, min_val=None, max_val=None):
-            """Internal helper method to set the bqplot scale
-
-            Parameters
-            ----------
-            scale
-                The Bqplot viewer scale
-            axis
-                The Specutils data axis
-            min_val
-                The lower bound of the axis to set. Can also be a Specutils SpectralRegion
-            max_val
-                The upper bound of the axis to set
-            """
-            if min_val is not None:
-                # If SpectralRegion, set limits to region's lower and upper bounds
-                if isinstance(min_val, SpectralRegion):
-                    return self._set_scale(scale, axis, min_val.lower, min_val.upper)
-                # If user's value has a unit, convert it to the current axis' units
-                elif isinstance(min_val, u.Quantity):
-                    # Convert user's value to axis' units
-                    min_val = min_val.to(axis.unit).value
-                # If auto, set to min axis wavelength value
-                elif min_val == "auto":
-                    min_val = min(axis).value
-
-                scale.min = float(min_val)
-            if max_val is not None:
-                # If user's value has a unit, convert it to the current axis' units
-                if isinstance(max_val, u.Quantity):
-                    # Convert user's value to axis' units
-                    max_val = max_val.to(axis.unit).value
-                # If auto, set to max axis wavelength value
-                elif max_val == "auto":
-                    max_val = max(axis).value
-
-                scale.max = float(max_val)
             
-            
-    s = OWLSviz()
+    s = Specviz()
     s.app.template.template = s.app.template.template.replace(
-        'calc(100% - 48px);', '90vh !important;'
+        'calc(100% - 48px);', '800px'#'80vh !important;'
     )
+    
+    height = '800px'
+    s.app.layout.height = height
+    s.app.state.settings['context']['notebook']['max_height'] = height
 
     h_centroid = 3968.4673 * u.Angstrom
     k_centroid = 3933.6614 * u.Angstrom
     roi_half_width = 3 * u.Angstrom
 
-    rois = []
-    for line in [k_centroid, h_centroid]:
-        rois.append(
-            XRangeROI(
-                (line - roi_half_width).to(u.AA).value,
-                (line + roi_half_width).to(u.AA).value
-            )
-        )
-
     def add_spectrum_from_url(viz_helper, data_url):
-        all_orders = SpectrumCollection.read(
-            download_file(data_url, cache=True)
-        )
-        target_name = all_orders.meta['header']['OBJNAME']        
-
-        # Delete existing subsets
-        for subset_grp in viz_helper.app.data_collection.subset_groups:
-            viz_helper.app.data_collection.remove_subset_group(subset_grp)
-
-        for ref, order, centroid, roi in zip(['h', 'k'], [90, 89], [k_centroid, h_centroid], rois):
-            # viz_helper.app.state.viewer_icons[ref] = f"{order}"
-            spectrum = all_orders[order]
-            spectrum.uncertainty = StdDevUncertainty(np.sqrt(spectrum.flux.value))
-            data_label = f"{target_name}, Order {order}"
-            s._default_spectrum_viewer_reference_name = ref
-            viz_helper.load_data(spectrum, data_label=data_label, show_in_viewer=ref)
-
-            viz_helper.app.add_data_to_viewer(ref, data_label, clear_other_data=True)    
-            spectrum_viewer = viz_helper.app.get_viewer(ref)
-
-            # Set the active edit_subset_mode to NewMode to be able to add multiple subregions
-            spectrum_viewer.session.edit_subset_mode._mode = NewMode
-            spectrum_viewer.apply_roi(roi)
-            
-            spectrum_viewer.state.reset_limits()
-            
-            viz_helper.x_limits(
-                centroid - 6 * roi_half_width, 
-                centroid + 6 * roi_half_width
+        if data_url not in urls_loaded:
+            all_orders = SpectrumCollection.read(
+                download_file(data_url, cache=True)
             )
+            target_name = all_orders.meta['header']['OBJNAME']        
+            date = ':'.join(all_orders.meta['header']['DATE-OBS'].split(':')[:-1])
 
-    def on_click(widget, event, data):
-        add_spectrum_from_url(s, links[data]['url'])
-    
+            data_label = f'{target_name} @ {date}'
+            viz_helper.load_data(combine_orders(all_orders), data_label)
+            spectrum_viewer = viz_helper.app.get_viewer(viz_helper._default_spectrum_viewer_reference_name)            
+            spectrum_viewer.state.reset_limits()
+            urls_loaded.add(data_url)
+        
+    def on_click(data):
+        for link_key in data:
+            add_spectrum_from_url(s, links[link_key]['url'])
     
     with solara.Column():
-        a = v.Select(
-            v_model='HAT-P-11 @ 2021-09-11 07:27',
-            label='Observation',
-            items=sorted(links.keys()))
+        solara.Markdown("# [Olin Wilson Legacy Survey (OWLS)](https://owls.readthedocs.io/)\n### Interactive spectrum visualizer")
 
-        a.on_event('change', on_click)
+        link_selected = solara.reactive([])
+        solara.SelectMultiple("Observation", link_selected, list(links.keys()), on_value=on_click)
+        
+        display(s.app)
 
-        add_spectrum_from_url(s, links[a.v_model]['url'])
-
-        title = v.Html(
-            tag='h1',
-            children=['Olin Wilson Legacy Survey (OWLS) Spectrum Visualizer']
+        solara.Markdown(
+            f"CaII K and H = {k_centroid.value:.2f} and {h_centroid:.2f} (rest)\n\n"
+            "Powered by [jdaviz](https://jdaviz.readthedocs.io/) and [solara](https://solara.dev/)"
         )
-
-
-        subtitle = v.Text(
-            children=['Powered by jdaviz']
-        )
-
-
-        content_main = v.Layout(
-            column=True,
-            _metadata={'mount_id': 'content-main'},
-            children=[title, subtitle, a, s.app]
-        )
-
-        display(content_main)
