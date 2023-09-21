@@ -9,7 +9,7 @@ def Page():
     from astropy.utils.data import download_file
     from astropy.nddata import StdDevUncertainty
 
-    from specutils import SpectrumList, SpectrumCollection
+    from specutils import SpectrumList, SpectrumCollection, SpectralRegion
 
     from glue.core.roi import XRangeROI
     from glue.core.edit_subset_mode import NewMode
@@ -116,8 +116,71 @@ def Page():
                                   spectral_subset=spectral_subset, function=function,
                                   cls=cls, use_display_units=use_display_units)
 
+        def x_limits(self, x_min=None, x_max=None):
+            """Sets the limits of the x-axis
+
+            Parameters
+            ----------
+            x_min
+                The lower bound of the axis. Can also be a Specutils SpectralRegion
+            x_max
+                The upper bound of the axis
+            """
+            scale = self.app.get_viewer(self._default_spectrum_viewer_reference_name).scale_x
+            if x_min is None and x_max is None:
+                return scale
+
+            # Retrieve the spectral axis
+            ref_index = getattr(
+                self.app.get_viewer(self._default_spectrum_viewer_reference_name).state.reference_data,
+                "label", None
+            )
+            ref_spec = self.get_data(ref_index)
+            self._set_scale(scale, ref_spec.spectral_axis, x_min, x_max)
+
+        def _set_scale(self, scale, axis, min_val=None, max_val=None):
+            """Internal helper method to set the bqplot scale
+
+            Parameters
+            ----------
+            scale
+                The Bqplot viewer scale
+            axis
+                The Specutils data axis
+            min_val
+                The lower bound of the axis to set. Can also be a Specutils SpectralRegion
+            max_val
+                The upper bound of the axis to set
+            """
+            if min_val is not None:
+                # If SpectralRegion, set limits to region's lower and upper bounds
+                if isinstance(min_val, SpectralRegion):
+                    return self._set_scale(scale, axis, min_val.lower, min_val.upper)
+                # If user's value has a unit, convert it to the current axis' units
+                elif isinstance(min_val, u.Quantity):
+                    # Convert user's value to axis' units
+                    min_val = min_val.to(axis.unit).value
+                # If auto, set to min axis wavelength value
+                elif min_val == "auto":
+                    min_val = min(axis).value
+
+                scale.min = float(min_val)
+            if max_val is not None:
+                # If user's value has a unit, convert it to the current axis' units
+                if isinstance(max_val, u.Quantity):
+                    # Convert user's value to axis' units
+                    max_val = max_val.to(axis.unit).value
+                # If auto, set to max axis wavelength value
+                elif max_val == "auto":
+                    max_val = max(axis).value
+
+                scale.max = float(max_val)
+            
+            
     s = OWLSviz()
-    # s.plugins['Model Fitting']._obj.dataset._viewers = ['h', 'k']
+    s.app.template.template = s.app.template.template.replace(
+        'calc(100% - 48px);', '90vh !important;'
+    )
 
     h_centroid = 3968.4673 * u.Angstrom
     k_centroid = 3933.6614 * u.Angstrom
@@ -142,7 +205,7 @@ def Page():
         for subset_grp in viz_helper.app.data_collection.subset_groups:
             viz_helper.app.data_collection.remove_subset_group(subset_grp)
 
-        for ref, order, roi in zip(['h', 'k'], [90, 89], rois):
+        for ref, order, centroid, roi in zip(['h', 'k'], [90, 89], [k_centroid, h_centroid], rois):
             # viz_helper.app.state.viewer_icons[ref] = f"{order}"
             spectrum = all_orders[order]
             spectrum.uncertainty = StdDevUncertainty(np.sqrt(spectrum.flux.value))
@@ -156,6 +219,13 @@ def Page():
             # Set the active edit_subset_mode to NewMode to be able to add multiple subregions
             spectrum_viewer.session.edit_subset_mode._mode = NewMode
             spectrum_viewer.apply_roi(roi)
+            
+            spectrum_viewer.state.reset_limits()
+            
+            viz_helper.x_limits(
+                centroid - 6 * roi_half_width, 
+                centroid + 6 * roi_half_width
+            )
 
     def on_click(widget, event, data):
         add_spectrum_from_url(s, links[data]['url'])
